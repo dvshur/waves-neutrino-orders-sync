@@ -1,66 +1,38 @@
-use std::time::Instant;
-use waves_protobuf_schemas::waves::node::grpc::accounts_api_client::AccountsApiClient;
-use waves_protobuf_schemas::waves::node::grpc::DataRequest;
+mod orders;
+mod routines;
+
+use mpsc::UnboundedReceiver;
+use tokio::stream::StreamExt;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // control mainnet
-    // let address: Vec<u8> = vec![
-    //     1, 87, 35, 179, 173, 18, 92, 147, 164, 202, 236, 57, 254, 79, 70, 214, 205, 86, 77, 45,
-    //     251, 16, 251, 99, 152, 122,
-    // ];
+    // todo config
 
-    // auction mainnet
-    let address: Vec<u8> = vec![
-        1, 87, 154, 181, 157, 184, 139, 62, 65, 106, 107, 228, 24, 157, 46, 59, 10, 118, 175, 6,
-        34, 208, 53, 138, 117, 16,
-    ];
+    // listen to new orders and push their ids to the stream
+    let (retries_tx, retries) = mpsc::unbounded_channel();
 
-    // liquidation mainnet
-    // let address: Vec<u8> = vec![
-    //     1, 87, 26, 234, 73, 203, 250, 10, 126, 202, 8, 127, 40, 213, 159, 149, 142, 12, 123, 105,
-    //     181, 169, 56, 145, 31, 72,
-    // ];
+    let order_ids = routines::listen::start();
 
-    assert_eq!(address.len(), 26);
+    let order_ids_with_retries = order_ids.merge(retries);
 
-    // remove 2 first and 4 last bytes from address for Go Node
-    let address = Vec::from(&address[2..22]);
-    assert_eq!(address.len(), 20);
+    // fetch orders info from Node and send downstream
+    let order_fetch_results = routines::fetch::start(10, order_ids_with_retries);
 
-    // let mut client = AccountsApiClient::connect("http://grpc.wavesnodes.com:6870").await?;
-    let mut client =
-        AccountsApiClient::connect("http://mainnet-go-htz-fsn1-1.wavesnodes.com:6870").await?;
-
-    let request = tonic::Request::new(DataRequest {
-        address: address,
-        key: String::new(),
+    let successfully_inserted = order_fetch_results.filter_map(|res| match res {
+        Ok(v) => Some(v),
+        Err(_) => None,
     });
 
-    let request_start_time = Instant::now();
+    // insert orders info into database
+    let insertion_results = routines::insert::start(successfully_inserted);
 
-    // todo how does streaming in tonic work?
-    let mut stream = client.get_data_entries(request).await?.into_inner();
-
-    let mut data_entries = Vec::new();
-    let mut counter: usize = 0;
-    while let Some(entry) = stream.message().await? {
-        data_entries.push(entry);
-        counter += 1;
-        if counter % 1000 == 0 {
-            println!(
-                "{} records received, average time per record: {:?}",
-                &counter,
-                request_start_time.elapsed() / counter as u32
-            );
+    // todo error handling
+    tokio::spawn(async move {
+        while let Some(msg) = successfully_inserted.recv().await {
+            println!("{}", msg);
         }
-    }
-
-    println!(
-        "Time elapsed: {:?}, response length {}",
-        request_start_time.elapsed(),
-        data_entries.len()
-    );
+    });
 
     Ok(())
 }
